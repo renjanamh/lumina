@@ -1,0 +1,861 @@
+'use client';
+
+import { useState, useEffect } from 'react';
+import { useAccount, useWriteContract, useWaitForTransactionReceipt, useReadContract } from 'wagmi';
+import { parseUnits } from 'viem';
+import { LoadingSpinner } from '@/components/ui/LoadingSpinner';
+import { useToast } from '@/hooks/useToast';
+import { formatDistanceToNow } from 'date-fns';
+import { CONTRACTS, ASSET_TOKEN } from '@/lib/contracts';
+import { LeaderboardSection } from '@/components/leaderboard/LeaderboardSection';
+import { usePolymarketData } from '@/hooks/usePolymarketData';
+import { AnimatedPrice } from '@/components/ui/AnimatedPrice';
+import { useRiskOracle } from '@/hooks/useRiskOracle';
+// Removed MarketResolutionStatus - internal mechanism, not user-facing
+
+interface PredictionMarket {
+  id: string;
+  marketId: number;
+  protocol: string;
+  question: string;
+  icon: string;
+  riskType: string;
+  deadline: string;
+  status: string;
+  outcome: string;
+  yesVotes: number;
+  noVotes: number;
+  yesPool: number;
+  noPool: number;
+  yesOdds: string;
+  noOdds: string;
+  totalVolume: number;
+  participantCount: number;
+  insuranceEnabled: boolean;
+}
+
+export default function PredictionsClient() {
+  const { address } = useAccount();
+  const { showToast } = useToast();
+  const [markets, setMarkets] = useState<PredictionMarket[]>([]);
+  const [filter, setFilter] = useState<'all' | 'active' | 'resolved'>('active');
+  const [categoryFilter, setCategoryFilter] = useState<string>('all');
+  const [selectedMarket, setSelectedMarket] = useState<PredictionMarket | null>(null);
+  const [betAmount, setBetAmount] = useState('');
+  const [betOutcome, setBetOutcome] = useState<'Yes' | 'No'>('Yes');
+  const [placing, setPlacing] = useState(false);
+  const [insuranceEnabled, setInsuranceEnabled] = useState(true); // Toggle for insurance
+
+  // AI Risk Oracle integration
+  const riskOracleData = selectedMarket ? {
+    marketId: selectedMarket.id,
+    question: selectedMarket.question,
+    yesOdds: parseFloat(selectedMarket.yesOdds),
+    noOdds: parseFloat(selectedMarket.noOdds),
+    totalVolume: selectedMarket.totalVolume,
+    liquidity: selectedMarket.yesPool + selectedMarket.noPool,
+    timeToExpiry: selectedMarket.deadline ? 
+      Math.max(0, (new Date(selectedMarket.deadline).getTime() - Date.now()) / (1000 * 60 * 60)) : 24,
+    category: selectedMarket.riskType,
+  } : null;
+  
+  const { assessment: riskAssessment, loading: riskLoading } = useRiskOracle(riskOracleData);
+
+  // Use Polymarket data with category filter
+  const { markets: polymarketData, loading, error } = usePolymarketData(categoryFilter === 'all' ? undefined : categoryFilter);
+
+  useEffect(() => {
+    console.log('🔍 Polymarket Data:', { 
+      count: polymarketData.length, 
+      loading, 
+      error,
+      categoryFilter,
+      sample: polymarketData[0] 
+    });
+    
+    if (polymarketData.length > 0) {
+      // Transform Polymarket data to PredictionMarket format
+      const transformedMarkets: PredictionMarket[] = polymarketData.map((market, index) => {
+        // Sentiment is already in percentage (0-100), no need to divide
+        const yesPrice = market.sentiment.bullish;
+        const noPrice = market.sentiment.bearish;
+        
+        // Use category from API (already normalized)
+        const normalizedCategory = market.category || 'Other';
+        
+        // Extract protocol/subject from title more intelligently
+        const titleLower = market.title.toLowerCase();
+        const titleWords = market.title.split(' ');
+        let protocol = normalizedCategory; // Default to category name
+        
+        // Look for recognizable entities in the title
+        if (titleLower.includes('bitcoin') || titleLower.includes('btc')) {
+          protocol = 'Bitcoin';
+        } else if (titleLower.includes('ethereum') || titleLower.includes('eth')) {
+          protocol = 'Ethereum';
+        } else if (titleLower.includes('solana') || titleLower.includes('sol')) {
+          protocol = 'Solana';
+        } else if (titleLower.includes('fed') || titleLower.includes('federal reserve')) {
+          protocol = 'Fed';
+        } else if (titleLower.includes('trump')) {
+          protocol = 'Trump';
+        } else if (titleLower.includes('biden')) {
+          protocol = 'Biden';
+        } else if (titleLower.includes('lakers')) {
+          protocol = 'Lakers';
+        } else if (titleLower.includes('warriors')) {
+          protocol = 'Warriors';
+        } else if (titleLower.includes('real madrid')) {
+          protocol = 'Real Madrid';
+        } else if (titleLower.includes('barcelona')) {
+          protocol = 'Barcelona';
+        } else if (titleLower.includes('manchester')) {
+          protocol = 'Man United';
+        } else if (titleLower.includes('premier league')) {
+          protocol = 'Premier League';
+        } else if (titleLower.includes('champions league') || titleLower.includes('ucl')) {
+          protocol = 'Champions League';
+        } else if (titleLower.includes('nba')) {
+          protocol = 'NBA';
+        } else if (titleLower.includes('nfl')) {
+          protocol = 'NFL';
+        } else if (titleWords.length > 0) {
+          // Use first meaningful word (not "Will", "How", "Which", etc.)
+          const skipWords = ['will', 'how', 'which', 'when', 'who', 'what', 'is', 'are', 'the', 'a', 'an', 'does', 'do', 'can'];
+          protocol = titleWords.find(word => !skipWords.includes(word.toLowerCase())) || normalizedCategory;
+        }
+        
+        return {
+          id: market.id,
+          marketId: index + 1,
+          protocol: protocol,
+          question: market.title,
+          icon: getCategoryIcon(normalizedCategory, market.title),
+          riskType: normalizedCategory,
+          deadline: market.endDate,
+          status: market.active ? 'Active' : 'Resolved',
+          outcome: 'Unresolved',
+          yesVotes: Math.floor(market.volume * (yesPrice / 100) / 1000),
+          noVotes: Math.floor(market.volume * (noPrice / 100) / 1000),
+          yesPool: market.volume * (yesPrice / 100),
+          noPool: market.volume * (noPrice / 100),
+          yesOdds: market.sentiment.bullish.toString(),
+          noOdds: market.sentiment.bearish.toString(),
+          totalVolume: market.volume,
+          participantCount: market.insuredCount,
+          insuranceEnabled: true,
+        };
+      });
+
+      // Apply status filter
+      const filtered = transformedMarkets.filter(m => {
+        if (filter === 'all') return true;
+        if (filter === 'active') return m.status === 'Active';
+        if (filter === 'resolved') return m.status === 'Resolved';
+        return true;
+      });
+
+      setMarkets(filtered);
+    }
+  }, [polymarketData, filter, loading, error, categoryFilter]);
+
+  useEffect(() => {
+    if (error) {
+      showToast('Failed to load markets from Polymarket', 'error');
+    }
+  }, [error, showToast]);
+
+  // Helper function to get icon based on category and title
+  const getCategoryIcon = (category: string, title?: string): string => {
+    const categoryLower = category.toLowerCase();
+    const titleLower = title?.toLowerCase() || '';
+    
+    // Check title for specific icons first
+    if (titleLower.includes('bitcoin') || titleLower.includes('btc')) return '₿';
+    if (titleLower.includes('ethereum') || titleLower.includes('eth')) return '⟠';
+    if (titleLower.includes('solana') || titleLower.includes('sol')) return '◎';
+    if (titleLower.includes('fed') || titleLower.includes('federal reserve')) return '🏦';
+    if (titleLower.includes('trump')) return '🇺🇸';
+    if (titleLower.includes('biden')) return '🇺🇸';
+    if (titleLower.includes('election')) return '🗳️';
+    if (titleLower.includes('lakers')) return '🏀';
+    if (titleLower.includes('warriors')) return '🏀';
+    if (titleLower.includes('nba')) return '🏀';
+    if (titleLower.includes('nfl')) return '🏈';
+    if (titleLower.includes('football') && !titleLower.includes('american')) return '⚽';
+    if (titleLower.includes('soccer')) return '⚽';
+    if (titleLower.includes('real madrid') || titleLower.includes('barcelona')) return '⚽';
+    if (titleLower.includes('premier league') || titleLower.includes('champions league')) return '⚽';
+    
+    // Fallback to category icons
+    const icons: Record<string, string> = {
+      'crypto': '₿',
+      'cryptocurrency': '₿',
+      'politics': '🗳️',
+      'sports': '⚽',
+      'football': '⚽',
+      'soccer': '⚽',
+      'basketball': '🏀',
+      'tech': '💻',
+      'technology': '💻',
+      'ai': '🤖',
+      'finance': '💰',
+      'business': '💼',
+      'science': '🔬',
+      'entertainment': '🎬',
+      'pop culture': '🎬',
+      'other': '📊',
+    };
+    return icons[categoryLower] || '📊';
+  };
+
+  // Contract interactions
+  const { writeContract: approveToken, data: approveHash } = useWriteContract();
+  const { writeContract: placeBet, data: betHash } = useWriteContract();
+  
+  useWaitForTransactionReceipt({ hash: approveHash });
+  useWaitForTransactionReceipt({ hash: betHash });
+
+  // Check allowance
+  const { data: allowance } = useReadContract({
+    ...ASSET_TOKEN,
+    functionName: 'allowance',
+    args: address && CONTRACTS.PredictionMarket.address 
+      ? [address, CONTRACTS.PredictionMarket.address]
+      : undefined,
+  });
+
+  const placePrediction = async () => {
+    if (!selectedMarket || !betAmount || !address) return;
+
+    try {
+      setPlacing(true);
+      
+      const betAmountParsed = parseUnits(betAmount, 18);
+      const totalAmount = insuranceEnabled 
+        ? parseUnits((parseFloat(betAmount) + calculateInsurancePremium()).toFixed(2), 18)
+        : betAmountParsed;
+      
+      const marketId = BigInt(selectedMarket.marketId);
+      
+      // Check if approval needed
+      const currentAllowance = allowance as bigint || 0n;
+      if (currentAllowance < totalAmount) {
+        showToast('Approving USDC...', 'info');
+        
+        approveToken({
+          ...ASSET_TOKEN,
+          functionName: 'approve',
+          args: [CONTRACTS.PredictionMarket.address, totalAmount],
+        });
+        
+        // Wait for approval
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+      
+      // Place bet (with or without insurance)
+      const message = insuranceEnabled 
+        ? 'Placing protected bet...' 
+        : 'Placing bet...';
+      showToast(message, 'info');
+      
+      // Place bet (insurance handled by premium in amount)
+      placeBet({
+        ...CONTRACTS.PredictionMarket,
+        functionName: 'placeBet',
+        args: [marketId, betOutcome === 'Yes', betAmountParsed],
+      });
+      
+      // Wait for transaction
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      
+      const successMsg = insuranceEnabled
+        ? `✅ Placed protected bet: ${betAmount} USDC on ${betOutcome}!`
+        : `✅ Placed ${betAmount} USDC on ${betOutcome}!`;
+      showToast(successMsg, 'success');
+      
+      setSelectedMarket(null);
+      setBetAmount('');
+      setInsuranceEnabled(true); // Reset to default
+    } catch (error) {
+      console.error('Failed to place prediction:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Failed to place prediction';
+      showToast(errorMessage, 'error');
+    } finally {
+      setPlacing(false);
+    }
+  };
+
+  const calculateInsurancePremium = () => {
+    if (!selectedMarket || !betAmount) return 0;
+    const amount = parseFloat(betAmount);
+    
+    // Use AI-calculated premium rate if available
+    if (riskAssessment && !riskLoading) {
+      return amount * (riskAssessment.premiumRate / 100);
+    }
+    
+    // Fallback: Calculate market skew
+    const totalPool = selectedMarket.yesPool + selectedMarket.noPool;
+    const skew = Math.abs(selectedMarket.yesPool - selectedMarket.noPool) / totalPool;
+    
+    // Dynamic premium based on market skew
+    if (skew > 0.7) return amount * 0.30; // 30% for very skewed markets
+    if (skew > 0.5) return amount * 0.25; // 25% for moderate
+    return amount * 0.20; // 20% for balanced
+  };
+
+  const calculateInsuranceRefund = () => {
+    if (!selectedMarket || !betAmount) return 0;
+    const amount = parseFloat(betAmount);
+    
+    // Use AI-calculated payout rate if available
+    if (riskAssessment && !riskLoading) {
+      return amount * (riskAssessment.payoutRate / 100);
+    }
+    
+    // Fallback: Calculate market skew
+    const totalPool = selectedMarket.yesPool + selectedMarket.noPool;
+    const skew = Math.abs(selectedMarket.yesPool - selectedMarket.noPool) / totalPool;
+    
+    // Dynamic refund based on market skew
+    if (skew > 0.7) return amount * 0.70; // 70% refund for very skewed
+    if (skew > 0.5) return amount * 0.60; // 60% for moderate
+    return amount * 0.50; // 50% for balanced
+  };
+
+  const calculatePotentialPayout = () => {
+    if (!selectedMarket || !betAmount) return 0;
+    const amount = parseFloat(betAmount);
+    const oppositePool = betOutcome === 'Yes' ? selectedMarket.noPool : selectedMarket.yesPool;
+    const myPool = betOutcome === 'Yes' ? selectedMarket.yesPool : selectedMarket.noPool;
+    
+    if (myPool === 0) return amount * 2;
+    const share = amount / (myPool + amount);
+    return amount + (oppositePool * share);
+  };
+
+  const getRefundPercentage = (market: PredictionMarket) => {
+    // Use AI assessment if available for selected market
+    if (selectedMarket?.id === market.id && riskAssessment && !riskLoading) {
+      return Math.round(riskAssessment.payoutRate);
+    }
+    
+    const totalPool = market.yesPool + market.noPool;
+    const skew = Math.abs(market.yesPool - market.noPool) / totalPool;
+    
+    if (skew > 0.7) return 70;
+    if (skew > 0.5) return 60;
+    return 50;
+  };
+
+  const getPremiumPercentage = (market: PredictionMarket) => {
+    // Use AI assessment if available for selected market
+    if (selectedMarket?.id === market.id && riskAssessment && !riskLoading) {
+      return Math.round(riskAssessment.premiumRate);
+    }
+    
+    const totalPool = market.yesPool + market.noPool;
+    const skew = Math.abs(market.yesPool - market.noPool) / totalPool;
+    
+    if (skew > 0.7) return 30;
+    if (skew > 0.5) return 25;
+    return 20;
+  };
+
+  if (loading) {
+    return (
+      <div className="flex justify-center items-center min-h-[400px]">
+        <LoadingSpinner size="lg" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-7xl mx-auto space-y-8">
+      {/* Header */}
+      <div className="mb-12">
+        <h1 className="text-4xl font-bold text-gray-900 mb-3">
+          Protected DeFi Predictions
+        </h1>
+        <p className="text-lg text-gray-600">
+          Every bet is protected. Get 20-70% back if you&apos;re wrong.
+        </p>
+      </div>
+      
+      {/* Category Filter */}
+      <div className="mb-6">
+        <div className="flex items-center gap-2 overflow-x-auto pb-2 scrollbar-hide">
+          {['all', 'crypto', 'politics', 'sports', 'tech', 'finance', 'science', 'entertainment'].map((cat) => (
+            <button
+              key={cat}
+              onClick={() => setCategoryFilter(cat)}
+              className={`px-4 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition-all ${
+                categoryFilter === cat
+                  ? 'bg-gray-900 text-white shadow-lg'
+                  : 'bg-white text-gray-600 hover:bg-gray-100 border border-gray-200'
+              }`}
+            >
+              {cat === 'all' ? '🌐 All' : 
+               cat === 'crypto' ? '₿ Crypto' :
+               cat === 'politics' ? '🗳️ Politics' :
+               cat === 'sports' ? '⚽ Sports' :
+               cat === 'tech' ? '💻 Tech' :
+               cat === 'finance' ? '💰 Finance' :
+               cat === 'science' ? '🔬 Science' :
+               cat === 'entertainment' ? '🎬 Entertainment' : cat}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Filter Tabs */}
+      <div className="flex gap-3 mb-8 border-b border-gray-200">
+        <button
+          onClick={() => setFilter('all')}
+          className={`px-6 py-3 text-sm font-medium transition-all relative ${
+            filter === 'all'
+              ? 'text-gray-900'
+              : 'text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          All Markets
+          {filter === 'all' && (
+            <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-gray-900" />
+          )}
+        </button>
+        <button
+          onClick={() => setFilter('active')}
+          className={`px-6 py-3 text-sm font-medium transition-all relative ${
+            filter === 'active'
+              ? 'text-gray-900'
+              : 'text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          Active
+          {filter === 'active' && (
+            <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-gray-900" />
+          )}
+        </button>
+        <button
+          onClick={() => setFilter('resolved')}
+          className={`px-6 py-3 text-sm font-medium transition-all relative ${
+            filter === 'resolved'
+              ? 'text-gray-900'
+              : 'text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          Resolved
+          {filter === 'resolved' && (
+            <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-gray-900" />
+          )}
+        </button>
+      </div>
+
+      {/* Markets Grid */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        {markets.map((market) => (
+          <div
+            key={market.id}
+            className="group bg-white rounded-2xl border border-gray-200 hover:border-gray-300 hover:shadow-xl transition-all duration-300 overflow-hidden flex flex-col"
+          >
+            {/* Card Header with Icon */}
+            <div className="p-6 bg-gradient-to-br from-gray-50 to-white border-b border-gray-100 flex-shrink-0">
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-white rounded-xl shadow-sm flex items-center justify-center text-xl border border-gray-100">
+                    {market.icon}
+                  </div>
+                  <div>
+                    <span className="text-xs text-gray-500 font-medium uppercase tracking-wide">{market.riskType}</span>
+                  </div>
+                </div>
+                {market.insuranceEnabled && (
+                  <div className="flex items-center gap-1 px-2.5 py-1 bg-blue-50 text-blue-700 rounded-lg text-xs font-semibold border border-blue-100">
+                    <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
+                      <path fillRule="evenodd" d="M2.166 4.999A11.954 11.954 0 0010 1.944 11.954 11.954 0 0017.834 5c.11.65.166 1.32.166 2.001 0 5.225-3.34 9.67-8 11.317C5.34 16.67 2 12.225 2 7c0-.682.057-1.35.166-2.001zm11.541 3.708a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                    </svg>
+                    Insured
+                  </div>
+                )}
+              </div>
+
+              {/* Question */}
+              <h3 className="text-base font-bold text-gray-900 leading-snug line-clamp-3 mb-3">
+                {market.question}
+              </h3>
+              
+              {/* Insurance Info */}
+              <div className="mt-3 pt-3 border-t border-gray-100">
+                <div className="flex items-center gap-2 text-xs">
+                  <svg className="w-3.5 h-3.5 text-blue-600" fill="currentColor" viewBox="0 0 20 20">
+                    <path fillRule="evenodd" d="M2.166 4.999A11.954 11.954 0 0010 1.944 11.954 11.954 0 0017.834 5c.11.65.166 1.32.166 2.001 0 5.225-3.34 9.67-8 11.317C5.34 16.67 2 12.225 2 7c0-.682.057-1.35.166-2.001zm11.541 3.708a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                  </svg>
+                  <span className="text-gray-700 font-semibold">
+                    Protected: Get {getRefundPercentage(market)}% back if you lose
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Market Stats */}
+            <div className="p-6 space-y-4 flex-1 flex flex-col">
+              {/* Voting Stats */}
+              <div className="flex items-center justify-between text-sm">
+                <div className="flex items-center gap-2 text-gray-600">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+                  </svg>
+                  <span className="font-medium">{market.participantCount} votes</span>
+                </div>
+                <div className="flex items-center gap-2 text-gray-600">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <span className="font-medium">${(market.totalVolume / 1000).toFixed(0)}K pool</span>
+                </div>
+              </div>
+
+              {/* Odds Display */}
+              <div className="grid grid-cols-2 gap-3">
+                <div className="bg-gradient-to-br from-green-50 to-emerald-50 rounded-xl p-4 border border-green-100">
+                  <div className="text-xs font-semibold text-green-700 mb-1">YES</div>
+                  <div className="text-2xl font-bold">
+                    <AnimatedPrice value={parseFloat(market.yesOdds)} decimals={1} suffix="%" className="text-green-600" />
+                  </div>
+                  <div className="text-xs text-green-600 mt-1">${(market.yesPool / 1000).toFixed(1)}K</div>
+                </div>
+                <div className="bg-gradient-to-br from-red-50 to-rose-50 rounded-xl p-4 border border-red-100">
+                  <div className="text-xs font-semibold text-red-700 mb-1">NO</div>
+                  <div className="text-2xl font-bold">
+                    <AnimatedPrice value={parseFloat(market.noOdds)} decimals={1} suffix="%" className="text-red-600" />
+                  </div>
+                  <div className="text-xs text-red-600 mt-1">${(market.noPool / 1000).toFixed(1)}K</div>
+                </div>
+              </div>
+
+              {/* Deadline */}
+              <div className="flex items-center gap-2 text-xs text-gray-500 pt-2 border-t border-gray-100 flex-grow">
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                <span>
+                  {market.deadline && !isNaN(new Date(market.deadline).getTime())
+                    ? `Closes ${formatDistanceToNow(new Date(market.deadline), { addSuffix: true })}`
+                    : 'Closing date TBA'
+                  }
+                </span>
+              </div>
+
+              {/* Action Button */}
+              {market.status === 'Active' && (
+                <a
+                  href={`/predictions/${market.id}`}
+                  className="w-full py-3 rounded-xl font-semibold transition-all duration-200 bg-gray-900 text-white hover:bg-gray-800 group-hover:shadow-lg flex items-center justify-center gap-2"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
+                  </svg>
+                  Trade Now
+                </a>
+              )}
+
+              {market.status === 'Resolved' && (
+                <div className="text-center py-3">
+                  <span className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold ${
+                    market.outcome === 'Yes' 
+                      ? 'bg-green-50 text-green-700 border border-green-200' 
+                      : 'bg-red-50 text-red-700 border border-red-200'
+                  }`}>
+                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                      <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                    </svg>
+                    Resolved: {market.outcome}
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {markets.length === 0 && (
+        <div className="text-center py-24">
+          <div className="w-20 h-20 bg-gray-100 rounded-2xl flex items-center justify-center mx-auto mb-6">
+            <svg className="w-10 h-10 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+            </svg>
+          </div>
+          <h3 className="text-2xl font-bold text-gray-900 mb-2">No Markets Available</h3>
+          <p className="text-gray-600 max-w-md mx-auto">
+            {filter === 'resolved' 
+              ? 'No resolved markets to display yet. Check back after markets close.' 
+              : 'New prediction markets will appear here. Check back soon for opportunities.'}
+          </p>
+        </div>
+      )}
+
+      {/* Leaderboard Section */}
+      <LeaderboardSection />
+
+      {/* Bet Modal */}
+      {selectedMarket && (
+        <div 
+          className="fixed inset-0 bg-black/60 backdrop-blur-md flex items-center justify-center z-50 p-4 animate-in fade-in duration-200 overflow-y-auto"
+          onClick={() => setSelectedMarket(null)}
+        >
+          <div 
+            className="bg-white rounded-3xl max-w-lg w-full shadow-2xl border border-gray-200 overflow-hidden animate-in zoom-in-95 duration-200 my-8 max-h-[90vh] flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header - Fixed */}
+            <div className="bg-gradient-to-br from-gray-50 to-white p-4 border-b border-gray-100 flex-shrink-0">
+              <div className="flex items-start justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-white rounded-xl shadow-sm flex items-center justify-center text-xl border border-gray-100">
+                    {selectedMarket.icon}
+                  </div>
+                  <div>
+                    <h2 className="text-lg font-bold text-gray-900">{selectedMarket.protocol}</h2>
+                    <p className="text-xs text-gray-600">
+                      {selectedMarket.riskType} Risk Market
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setSelectedMarket(null)}
+                  className="text-gray-400 hover:text-gray-900 transition-colors p-1 flex-shrink-0"
+                >
+                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            {/* Modal Content - Scrollable */}
+            <div className="p-5 space-y-4 overflow-y-auto flex-1">
+              {/* Outcome Selection */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Your prediction
+                </label>
+                <div className="grid grid-cols-2 gap-3">
+                  <button
+                    onClick={() => setBetOutcome('Yes')}
+                    className={`p-4 rounded-xl border-2 transition-all duration-200 ${
+                      betOutcome === 'Yes'
+                        ? 'border-green-500 bg-gradient-to-br from-green-50 to-emerald-50 shadow-lg scale-[1.02]'
+                        : 'border-gray-200 hover:border-gray-300 bg-white'
+                    }`}
+                  >
+                    <div className="text-xs font-semibold text-gray-600 mb-1">YES</div>
+                    <div className="text-2xl font-bold mb-1">
+                      <AnimatedPrice value={parseFloat(selectedMarket.yesOdds)} decimals={1} suffix="%" className="text-green-600" />
+                    </div>
+                    <div className="text-xs text-gray-500">
+                      ${(selectedMarket.yesPool / 1000).toFixed(1)}K pool
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => setBetOutcome('No')}
+                    className={`p-4 rounded-xl border-2 transition-all duration-200 ${
+                      betOutcome === 'No'
+                        ? 'border-red-500 bg-gradient-to-br from-red-50 to-rose-50 shadow-lg scale-[1.02]'
+                        : 'border-gray-200 hover:border-gray-300 bg-white'
+                    }`}
+                  >
+                    <div className="text-xs font-semibold text-gray-600 mb-1">NO</div>
+                    <div className="text-2xl font-bold mb-1">
+                      <AnimatedPrice value={parseFloat(selectedMarket.noOdds)} decimals={1} suffix="%" className="text-red-600" />
+                    </div>
+                    <div className="text-xs text-gray-500">
+                      ${(selectedMarket.noPool / 1000).toFixed(1)}K pool
+                    </div>
+                  </button>
+                </div>
+              </div>
+
+              {/* Amount Input */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Amount
+                </label>
+                <div className="relative">
+                  <input
+                    type="number"
+                    value={betAmount}
+                    onChange={(e) => setBetAmount(e.target.value)}
+                    placeholder="0.00"
+                    className="w-full bg-gray-50 border-2 border-gray-200 rounded-xl px-4 py-4 text-lg font-semibold text-gray-900 focus:border-gray-900 focus:outline-none focus:ring-4 focus:ring-gray-100 transition-all"
+                  />
+                  <div className="absolute right-4 top-1/2 -translate-y-1/2 text-gray-400 font-medium">
+                    USDC
+                  </div>
+                </div>
+                <div className="flex gap-2 mt-2">
+                  {[10, 50, 100, 500].map((amount) => (
+                    <button
+                      key={amount}
+                      onClick={() => setBetAmount(amount.toString())}
+                      className="flex-1 px-3 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-semibold rounded-lg transition-colors"
+                    >
+                      ${amount}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Insurance Toggle */}
+              {betAmount && parseFloat(betAmount) > 0 && (
+                <div className="space-y-3">
+                  {/* Toggle Switch */}
+                  <div className="flex items-center justify-between p-4 bg-gray-50 rounded-xl border border-gray-200">
+                    <div className="flex items-center gap-3">
+                      <svg className="w-5 h-5 text-gray-700" fill="currentColor" viewBox="0 0 20 20">
+                        <path fillRule="evenodd" d="M2.166 4.999A11.954 11.954 0 0010 1.944 11.954 11.954 0 0017.834 5c.11.65.166 1.32.166 2.001 0 5.225-3.34 9.67-8 11.317C5.34 16.67 2 12.225 2 7c0-.682.057-1.35.166-2.001zm11.541 3.708a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                      </svg>
+                      <div>
+                        <div className="text-sm font-semibold text-gray-900">Add Insurance Protection</div>
+                        <div className="text-xs text-gray-600">Get {getRefundPercentage(selectedMarket)}% back if you lose</div>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => setInsuranceEnabled(!insuranceEnabled)}
+                      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                        insuranceEnabled ? 'bg-blue-600' : 'bg-gray-300'
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                          insuranceEnabled ? 'translate-x-6' : 'translate-x-1'
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  {/* Insurance Details (when enabled) */}
+                  {insuranceEnabled && (
+                    <div className="bg-gradient-to-br from-blue-50 to-indigo-50 border-2 border-blue-200 rounded-xl p-4 animate-in fade-in duration-200">
+                      <div className="flex items-start gap-3">
+                        <div className="w-8 h-8 bg-blue-100 rounded-lg flex items-center justify-center shrink-0">
+                          <svg className="w-5 h-5 text-blue-600" fill="currentColor" viewBox="0 0 20 20">
+                            <path fillRule="evenodd" d="M2.166 4.999A11.954 11.954 0 0010 1.944 11.954 11.954 0 0017.834 5c.11.65.166 1.32.166 2.001 0 5.225-3.34 9.67-8 11.317C5.34 16.67 2 12.225 2 7c0-.682.057-1.35.166-2.001zm11.541 3.708a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                          </svg>
+                        </div>
+                        <div className="flex-1">
+                          <div className="flex items-center gap-2 mb-1">
+                            <div className="text-sm font-bold text-blue-900">
+                              Protected Bet
+                            </div>
+                            {riskLoading && (
+                              <div className="flex items-center gap-1 text-xs text-blue-600">
+                                <svg className="animate-spin h-3 w-3" fill="none" viewBox="0 0 24 24">
+                                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                                </svg>
+                                <span>AI calculating...</span>
+                              </div>
+                            )}
+                            {riskAssessment && !riskLoading && (
+                              <div className="flex items-center gap-1 text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full font-medium">
+                                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                                  <path d="M13 6a3 3 0 11-6 0 3 3 0 016 0zM18 8a2 2 0 11-4 0 2 2 0 014 0zM14 15a4 4 0 00-8 0v3h8v-3zM6 8a2 2 0 11-4 0 2 2 0 014 0zM16 18v-3a5.972 5.972 0 00-.75-2.906A3.005 3.005 0 0119 15v3h-3zM4.75 12.094A5.973 5.973 0 004 15v3H1v-3a3 3 0 013.75-2.906z" />
+                                </svg>
+                                AI-Powered
+                              </div>
+                            )}
+                          </div>
+                          <div className="text-xs text-blue-700 leading-relaxed">
+                            Get {getRefundPercentage(selectedMarket)}% back if you lose (${calculateInsuranceRefund().toFixed(2)})
+                          </div>
+                          <div className="text-xs text-blue-600 font-semibold mt-1">
+                            Premium: {getPremiumPercentage(selectedMarket)}% (+${calculateInsurancePremium().toFixed(2)})
+                          </div>
+                          {riskAssessment && !riskLoading && (
+                            <div className="text-xs text-blue-500 mt-2 pt-2 border-t border-blue-200">
+                              🤖 {riskAssessment.reasoning}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Cost Breakdown */}
+              {betAmount && parseFloat(betAmount) > 0 && (
+                <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 space-y-2">
+                  <div className="flex justify-between items-center text-sm">
+                    <span className="text-gray-600">Bet amount</span>
+                    <span className="text-gray-900 font-medium">
+                      ${parseFloat(betAmount).toFixed(2)}
+                    </span>
+                  </div>
+                  {insuranceEnabled && (
+                    <div className="flex justify-between items-center text-sm">
+                      <span className="text-gray-600">Insurance premium</span>
+                      <span className="text-gray-900 font-medium">
+                        +${calculateInsurancePremium().toFixed(2)}
+                      </span>
+                    </div>
+                  )}
+                  <div className="flex justify-between items-center text-sm pt-2 border-t border-gray-300">
+                    <span className="text-gray-700 font-medium">Total cost</span>
+                    <span className="text-gray-900 font-bold">
+                      ${(parseFloat(betAmount) + (insuranceEnabled ? calculateInsurancePremium() : 0)).toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="pt-2 border-t border-gray-300 space-y-1">
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs text-gray-600">If you win</span>
+                      <span className="text-sm text-green-600 font-bold">
+                        +${(calculatePotentialPayout() - parseFloat(betAmount)).toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs text-gray-600">If you lose</span>
+                      <span className={`text-sm font-bold ${insuranceEnabled ? 'text-blue-600' : 'text-red-600'}`}>
+                        {insuranceEnabled 
+                          ? `Get $${calculateInsuranceRefund().toFixed(2)} back`
+                          : 'Lose all'
+                        }
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Submit Button */}
+              <button
+                onClick={placePrediction}
+                disabled={!betAmount || placing || parseFloat(betAmount) <= 0}
+                className={`w-full py-3 rounded-xl font-semibold text-sm transition-all duration-200 ${
+                  !betAmount || placing || parseFloat(betAmount) <= 0
+                    ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                    : 'bg-gray-900 text-white hover:bg-gray-800 hover:shadow-lg active:scale-[0.98]'
+                }`}
+              >
+                {placing ? (
+                  <span className="flex items-center justify-center gap-2">
+                    <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                    Processing...
+                  </span>
+                ) : insuranceEnabled ? (
+                  `Place Protected Bet (${(parseFloat(betAmount) + calculateInsurancePremium()).toFixed(0)} USDC)`
+                ) : (
+                  `Place Bet (${parseFloat(betAmount).toFixed(0)} USDC)`
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
